@@ -2,6 +2,8 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import shutil
+import zipfile
 
 import cv2
 import numpy as np
@@ -10,7 +12,7 @@ import pytest
 import yaml
 
 from reconstruct import SETTINGS
-from offline_reconstruction.pipeline import discover_scans, execute, fingerprint, validate_scan, validate_settings
+from offline_reconstruction.pipeline import discover_scans, execute, fingerprint, session_for_scan, validate_scan, validate_settings
 
 
 @pytest.fixture
@@ -128,3 +130,49 @@ def test_weight_threshold_is_honored_and_failure_is_not_reported_as_complete(sca
     summary = json.loads(summary_path.read_text())
     assert summary["status"] == "failed" and summary["failed_scans"] == 1
     assert "no mesh" in summary["scans"][0]["error"]
+
+
+def test_nested_print_cycles_use_root_calibration_and_preserve_hierarchy(scan, tmp_path):
+    session = scan.parent
+    nested = session / "print_yaml_scan/cycle_0001/scan"
+    nested.parent.mkdir(parents=True)
+    scan.rename(nested)
+    second = session / "print_yaml_scan/cycle_0002/scan"
+    shutil.copytree(nested, second)
+    assert session_for_scan(nested) == session
+    assert discover_scans(session, session_names=[session.name]) == [nested, second]
+    assert discover_scans(session, scan_folders=["print_yaml_scan/cycle_0001/scan"]) == [nested]
+    settings = settings_for(nested, tmp_path)
+    settings["input_path"] = session
+    assert execute(settings) == 0
+    run, = settings["output_root"].iterdir()
+    for cycle in ("cycle_0001", "cycle_0002"):
+        output = run / session.name / "print_yaml_scan" / cycle / "scan"
+        assert json.loads((output / "result.json").read_text())["source_files_unchanged"]
+        provenance = json.loads((output / "input_provenance.json").read_text())
+        assert "config/depth_intrinsics.yaml" in provenance["sha256"]
+        assert (output / "tsdf_surface_mesh.ply").exists()
+    settings["output_root"] = session / "print_yaml_scan/new_outputs"
+    with pytest.raises(ValueError, match="outside the source session"):
+        execute(settings)
+
+
+def test_archived_reconstruction_can_be_restored_and_keeps_preview_and_metadata(scan, tmp_path):
+    settings = settings_for(scan, tmp_path)
+    settings["archive_outputs"] = True
+    assert execute(settings) == 0
+    result_path, = settings["output_root"].rglob("result.json")
+    result = json.loads(result_path.read_text())
+    output = result_path.parent
+    assert result["status"] == "complete" and result["artifact_archive"] == "artifacts.zip"
+    assert (output / "preview.png").is_file() and (output / "input_provenance.json").is_file()
+    assert not (output / "tsdf_surface_mesh.ply").exists()
+    restored = tmp_path / "restored"
+    with zipfile.ZipFile(output / result["artifact_archive"]) as packed:
+        assert packed.testzip() is None
+        assert "color_in_depth_rectified/alignment.json" in packed.namelist()
+        assert "tsdf_surface_confidence_colored.ply" in packed.namelist()
+        packed.extractall(restored)
+    mesh = o3d.io.read_triangle_mesh(str(restored / "tsdf_surface_mesh.ply"))
+    assert len(mesh.triangles) == result["triangles"] and mesh.has_vertex_colors()
+    assert np.median(np.asarray(mesh.vertices)[:, 2]) == pytest.approx(.495, abs=1e-5)

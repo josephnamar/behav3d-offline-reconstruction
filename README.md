@@ -41,7 +41,9 @@ data/
       ir_raw/                     # May be present; not used here.
 ```
 
-`input_path` may point to `data`, a session, a scan folder, or its manifest. Multiple scan folders within one session are supported. Existing `reconstruct` directories are ignored and aligned images are regenerated for each new run. The absolute `session.path` recorded in an old manifest is ignored, so captures can be moved between computers.
+`input_path` may point to `data`, a session, a scan folder, or its manifest. Multiple scan folders within one session are supported, including nested print cycles such as `SESSION/print_yaml_scan/cycle_0001/scan/manifest.yaml`, which use `SESSION/config`. The nearest ancestor containing a `config` directory supplies the calibration; incomplete calibration there is rejected. Each cycle is reconstructed separately and its hierarchy is preserved in the outputs. `scan_folders` can select a leaf name such as `scan` or a session-relative path such as `print_yaml_scan/cycle_0001/scan`.
+
+Existing `reconstruct` directories are ignored and aligned images are regenerated for each new run. The absolute `session.path` recorded in an old manifest is ignored, so captures can be moved between computers.
 
 Each manifest capture must include its relative `depth` and `color` paths and an explicit `T_base_tool0` pose, with `position: [x, y, z]` in metres and `orientation_xyzw: [x, y, z, w]`. Images are single-channel uint16 depth and three-channel uint8 color. Intrinsics use the existing OpenCV YAML keys `image_width`, `image_height`, `camera_matrix`, and `distortion_coefficients`. Extrinsics use `frames.T_tool0_ir` and `frames.T_tool0_color`, each with `xyz` in metres and `quat_xyzw`.
 
@@ -60,6 +62,7 @@ Optional path overrides and a validation-only command:
 ```bash
 python reconstruct.py --input /path/to/Scans --output /path/to/results
 python reconstruct.py --input /path/to/Scans --validate-only
+python reconstruct.py --input /path/to/Scans --archive-outputs
 ```
 
 With empty `session_names` and `scan_folders` lists, all discovered scans are processed sequentially. Populate those lists to select particular sessions or scan types. Set `undistort` to `False` for a separate comparison run. Set `open_viewer` to `True` to inspect each colored mesh interactively; otherwise no display is required.
@@ -73,6 +76,8 @@ The statistical/radius outlier filter affects the point clouds. Mesh noise remov
 ## Results
 
 Every invocation creates a new UTC timestamped directory under `output_root`. Outputs must be outside source sessions, and captured inputs are never modified. Paths below each run preserve the selected session/scan hierarchy.
+
+When disk space is limited, set `archive_outputs` to `True` or pass `--archive-outputs`. Each completed scan stores its mesh, point clouds and aligned images in `artifacts.zip`. The archive is verified before removing the unpacked copies created by that run. Previews, logs, plane metadata and JSON reports remain directly accessible. Extract the ZIP to access the original PLY/STL files; geometry and colors are unchanged. This needs enough free space for one scan's temporary unpacked outputs in addition to the completed archives.
 
 ```text
 results/RUN_ID/

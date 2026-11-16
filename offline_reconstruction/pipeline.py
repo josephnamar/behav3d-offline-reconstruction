@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 import uuid
+import zipfile
 
 import cv2
 import numpy as np
@@ -33,6 +34,14 @@ def fingerprint(paths, relative_to):
             for path in sorted(set(paths))}
 
 
+def session_for_scan(scan):
+    """Resolve flat captures and nested print cycles to their shared calibration."""
+    for parent in Path(scan).parents:
+        if (parent / "config").is_dir():
+            return parent
+    raise FileNotFoundError(f"No ancestor session/config directory found for scan: {scan}")
+
+
 def discover_scans(input_path, session_names=(), scan_folders=(), output_root=None):
     root = Path(input_path).expanduser().resolve()
     if not root.exists():
@@ -54,8 +63,9 @@ def discover_scans(input_path, session_names=(), scan_folders=(), output_root=No
             if "manifest.yaml" in files:
                 manifests.append(directory / "manifest.yaml")
     selected = sorted({p.parent for p in manifests
-                       if (not session_names or p.parent.parent.name in session_names)
-                       and (not scan_folders or p.parent.name in scan_folders)})
+                       if (not session_names or session_for_scan(p.parent).name in session_names)
+                       and (not scan_folders or p.parent.name in scan_folders
+                            or p.parent.relative_to(session_for_scan(p.parent)).as_posix() in scan_folders)})
     if not selected:
         raise ValueError(f"No scans matched under {root}. Expected SESSION/SCAN/manifest.yaml.")
     return selected
@@ -124,7 +134,7 @@ def validate_settings(s):
 
 def validate_scan(scan):
     """Check every raw frame and explicit pose; never substitute an identity pose."""
-    session = scan.parent
+    session = session_for_scan(scan)
     files = [scan / "manifest.yaml"]
     calibration = {}
     for kind in ("depth", "color"):
@@ -210,11 +220,13 @@ def configure_fusion(s):
 def reconstruct_scan(scan, output, s):
     configure_fusion(s)
     o3d.utility.random.seed(s["random_seed"])
-    color_to_depth.run(str(scan.parent), scan.name, output_dir=output,
+    session = session_for_scan(scan)
+    scan_folder = str(scan.relative_to(session))
+    color_to_depth.run(str(session), scan_folder, output_dir=output,
                        rectify_images=s["undistort"], depth_scale=s["depth_scale"],
                        depth_max=s["alignment_depth_max_m"])
     fusion.run(
-        str(scan.parent), scan.name, visualize=False, output_dir=output,
+        str(session), scan_folder, visualize=False, output_dir=output,
         device=s["device"], rectify_images=s["undistort"],
         voxel_size=s["voxel_size_m"], block_count=s["block_count"], block_resolution=s["block_resolution"],
         depth_max=s["depth_max_m"], depth_scale=s["depth_scale"],
@@ -261,13 +273,35 @@ class Tee:
             stream.flush()
 
 
+def archive_outputs(output):
+    """Verify a lossless archive before removing this run's unpacked artifacts."""
+    paths = sorted(list(output.glob("*.ply")) + list(output.glob("*.stl")))
+    aligned_dirs = [p for p in output.glob("color_in_depth*") if p.is_dir()]
+    paths += sorted(p for directory in aligned_dirs for p in directory.rglob("*") if p.is_file())
+    archive = output / "artifacts.zip"
+    temporary = output / ".artifacts.tmp.zip"
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as packed:
+        for path in paths:
+            packed.write(path, path.relative_to(output).as_posix())
+    with zipfile.ZipFile(temporary) as packed:
+        if packed.testzip() is not None:
+            raise IOError(f"Archive verification failed; unpacked files retained: {temporary}")
+    temporary.replace(archive)
+    for path in paths:
+        path.unlink()
+    for directory in aligned_dirs:
+        directory.rmdir()
+    return dict(artifact_archive=archive.name, archived_files=len(paths), archive_bytes=archive.stat().st_size)
+
+
 def execute(settings):
     validate_settings(settings)
     output_root = Path(settings["output_root"]).expanduser().resolve()
     scans = discover_scans(settings["input_path"], settings["session_names"], settings["scan_folders"], output_root)
+    sessions = {scan: session_for_scan(scan) for scan in scans}
     for scan in scans:
-        if output_root == scan.parent or scan.parent in output_root.parents:
-            raise ValueError(f"output_root must be outside the source session: {scan.parent}")
+        if output_root == sessions[scan] or sessions[scan] in output_root.parents:
+            raise ValueError(f"output_root must be outside the source session: {sessions[scan]}")
     print(f"Found {len(scans)} scan(s). Validating all raw frames, poses and calibration.")
     validated, failures = {}, []
     for scan in scans:
@@ -289,7 +323,7 @@ def execute(settings):
     write_json(run_dir / "settings.json", dict(settings=settings, versions=versions,
                effective_depth_bias_mm=round(settings["depth_bias_mm"] / 1000 * settings["depth_scale"]) / settings["depth_scale"] * 1000,
                thread_environment={key: os.environ.get(key) for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}))
-    common = Path(os.path.commonpath([str(scan.parent) for scan in scans]))
+    common = Path(os.path.commonpath([str(session) for session in sessions.values()]))
     summary = dict(status="running", scans=[], settings="settings.json")
     write_json(run_dir / "summary.json", summary)
     for scan in scans:
@@ -305,9 +339,11 @@ def execute(settings):
             print(f"\nReconstructing {scan}\nOutput: {output}")
             try:
                 row.update(reconstruct_scan(scan, output, settings))
-                after = fingerprint(info["files"], scan.parent)
+                after = fingerprint(info["files"], sessions[scan])
                 if after != info["hashes"]:
                     raise ValueError("Source files changed during reconstruction; result cannot be trusted.")
+                if settings.get("archive_outputs", False):
+                    row.update(archive_outputs(output))
                 row.update(status="complete", source_files_unchanged=True)
             except Exception as exc:
                 row.update(status="failed", error=str(exc))

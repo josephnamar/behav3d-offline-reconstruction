@@ -13,6 +13,7 @@ SETTINGS = {
     "scan_folders": [],  # [] = all; e.g. ["scan_yaml_targets"].
     "continue_on_error": True,  # Record failed scans and finish the others.
     "validate_only": False,  # Check every image, calibration and pose; no fusion.
+    "archive_outputs": False,  # Lossless ZIP per scan for meshes/clouds/aligned images.
 
     # Calibrated image correction. False gives a comparison without undistortion.
     "undistort": True,
@@ -93,6 +94,7 @@ def main(argv=None):
     parser.add_argument("--input", type=Path, help="Override input_path above")
     parser.add_argument("--output", type=Path, help="Override output_root above")
     parser.add_argument("--validate-only", action="store_true", help="Validate inputs without reconstruction")
+    parser.add_argument("--archive-outputs", action="store_true", help="Losslessly ZIP each scan's geometry and aligned images to save disk space")
     args = parser.parse_args(argv)
     settings = dict(SETTINGS)
     if args.input is not None:
@@ -101,6 +103,8 @@ def main(argv=None):
         settings["output_root"] = args.output
     if args.validate_only:
         settings["validate_only"] = True
+    if args.archive_outputs:
+        settings["archive_outputs"] = True
     # Set before importing NumPy/Open3D. Existing shell limits take precedence.
     for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(key, str(settings["cpu_threads"]))
