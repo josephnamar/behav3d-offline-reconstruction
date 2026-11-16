@@ -1,5 +1,5 @@
 """Stream complete cycle meshes and raw captures into two distinct 3D outcomes."""
-from contextlib import contextmanager, redirect_stdout, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stdout, redirect_stderr
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -161,16 +161,25 @@ def stack_meshes(root, rows, output, settings, scratch, bounds):
               + f"element face {n_faces}\nproperty list uchar int vertex_indices\nend_header\n").encode("ascii")
     face_start = len(header) + n_vertices * vertex_type.itemsize
     total_size = face_start + n_faces * face_type.itemsize
-    if shutil.disk_usage(output).free < total_size + 300 * 1024**2:
+    archived = settings["archive_stacked"]
+    if not archived and shutil.disk_usage(output).free < total_size + 300 * 1024**2:
         raise OSError(f"Stacked mesh requires {total_size / 1024**3:.2f} GiB plus 300 MiB working space.")
-    destination = output / "combined_mesh.ply"
-    temporary = output / ".combined_mesh.tmp.ply"
+    destination = output / ("combined_mesh.zip" if archived else "combined_mesh.ply")
+    temporary = output / (".combined_mesh.tmp.zip" if archived else ".combined_mesh.tmp.ply")
+    ply_hash = hashlib.sha256()
     records = []
     preview = o3d.geometry.PointCloud()
     vertex_offset = face_offset = 0
-    with temporary.open("w+b") as stream:
+    with ExitStack() as contexts:
+        if archived:
+            packed = contexts.enter_context(zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6))
+            stream = contexts.enter_context(packed.open("combined_mesh.ply", "w", force_zip64=True))
+        else:
+            stream = contexts.enter_context(temporary.open("w+b"))
         stream.write(header)
-        stream.truncate(total_size)
+        ply_hash.update(header)
+        if not archived:
+            stream.truncate(total_size)
         for number, row in enumerate(rows, 1):
             print(f"Stacking cycle {number}/{len(rows)}: {row['output']}", flush=True)
             with artifact(root, row, "tsdf_surface_mesh.ply", scratch) as source:
@@ -195,24 +204,50 @@ def stack_meshes(root, rows, output, settings, scratch, bounds):
             triangles = np.empty(len(faces), dtype=face_type)
             triangles["count"] = 3
             triangles["indices"] = faces.astype(np.int64) + vertex_offset
-            stream.seek(len(header) + vertex_offset * vertex_type.itemsize)
-            vertices.tofile(stream)
-            stream.seek(face_start + face_offset * face_type.itemsize)
-            triangles.tofile(stream)
+            if archived:
+                payload = vertices.tobytes()
+                stream.write(payload)
+                ply_hash.update(payload)
+            else:
+                stream.seek(len(header) + vertex_offset * vertex_type.itemsize)
+                vertices.tofile(stream)
+                stream.seek(face_start + face_offset * face_type.itemsize)
+                triangles.tofile(stream)
             records.append(dict(cycle=row["output"], mesh_sha256=source_hash,
                                 first_vertex=vertex_offset, vertices=len(xyz), first_triangle=face_offset, triangles=len(faces)))
             vertex_offset += len(xyz)
             face_offset += len(faces)
             preview += mesh_preview_cloud(mesh, settings["preview_voxel_size_m"])
             preview = preview.voxel_down_sample(settings["preview_voxel_size_m"])
-    if temporary.stat().st_size != total_size:
+        if archived:
+            # PLY stores all vertices before its faces. A second streamed pass
+            # avoids a full-size unpacked temporary file or in-memory mesh.
+            for number, (row, record) in enumerate(zip(rows, records), 1):
+                print(f"Archiving triangles {number}/{len(rows)}: {row['output']}", flush=True)
+                with artifact(root, row, "tsdf_surface_mesh.ply", scratch) as source:
+                    if digest(source) != record["mesh_sha256"]:
+                        raise ValueError(f"Cycle mesh changed while combining: {row['output']}")
+                    mesh = o3d.io.read_triangle_mesh(str(source))
+                faces = np.asarray(mesh.triangles)
+                triangles = np.empty(len(faces), dtype=face_type)
+                triangles["count"] = 3
+                triangles["indices"] = faces.astype(np.int64) + record["first_vertex"]
+                payload = triangles.tobytes()
+                stream.write(payload)
+                ply_hash.update(payload)
+    if archived:
+        with zipfile.ZipFile(temporary) as packed:
+            if packed.getinfo("combined_mesh.ply").file_size != total_size or packed.testzip() is not None:
+                raise IOError("Incomplete stacked mesh archive")
+    elif temporary.stat().st_size != total_size:
         raise IOError("Incomplete stacked PLY write")
     temporary.replace(destination)
     if not o3d.io.write_point_cloud(str(output / "preview_points.ply"), preview):
         raise IOError("Could not save stacked preview point cloud")
     save_cloud_preview(preview, output / "preview.png", settings, bounds)
     return dict(status="complete", vertices=n_vertices, triangles=n_faces, file=destination.name,
-                bytes=total_size, sha256=digest(destination), cycles=records,
+                bytes=destination.stat().st_size, uncompressed_bytes=total_size,
+                sha256=digest(destination), ply_sha256=ply_hash.hexdigest() if archived else digest(destination), cycles=records,
                 vertex_normals_included=settings["include_stacked_normals"],
                 geometry="All input triangles and coordinates retained; overlapping and intermediate surfaces remain.")
 

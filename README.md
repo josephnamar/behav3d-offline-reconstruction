@@ -106,12 +106,15 @@ The script returns exit code 1 if validation or a selected reconstruction fails.
 
 ```bash
 python combine_cycles.py --input /path/to/results/RUN_ID
+python combine_cycles.py --input /path/to/results/RUN_ID --archive-stacked
 ```
 
 On Windows, use `.\.venv\Scripts\python.exe combine_cycles.py --input "C:\Results\RUN_ID"`. The script uses the same Python environment and dependencies as reconstruction.
 
 - **Stacked:** `stacked/combined_mesh.ply` contains every input vertex, triangle and RGB value in the original robot-base coordinates. There is no alignment, smoothing, decimation or merging of overlapping faces. Intermediate surfaces, repeated table surfaces and existing artifacts remain. To reduce file size, vertex normals are omitted by default; viewers can recompute these shading vectors. Set `include_stacked_normals=True` to retain them too. The script streams each mesh into the combined file, so it does not need to load the complete model into memory. A long sequence can still produce a very large final mesh.
 - **Fused:** `fused/tsdf_surface_mesh.ply` is a new joint TSDF reconstruction from every selected cycle's original depth captures and saved poses. It retains calibrated undistortion and the processing settings recorded in that run, accumulates color observations across cycles, then applies the existing crop/cleanup/export workflow. It also writes STL and RGB/confidence point clouds. This mode requires the original raw captures, calibration and aligned images, and verifies that source hashes match the saved run.
+
+Set `archive_stacked=True` or pass `--archive-stacked` to write `stacked/combined_mesh.zip` directly, without a full-size unpacked temporary file. Its `combined_mesh.ply` is lossless and retains every triangle and RGB value. Extract it before opening it in a mesh viewer.
 
 Both modes read unpacked results or `artifacts.zip` automatically. Every selected cycle must be complete and use the same coordinate-frame name. This does not establish alignment between separate physical setups that happen to use the same frame name; select cycles from the same setup. The `cycle_names` setting can select a subset. Use `--mode stacked` or `--mode fused` for only one outcome.
 

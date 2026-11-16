@@ -52,8 +52,10 @@ def load_source(root, row, temporary):
     return o3d.io.read_triangle_mesh(str(temporary / "tsdf_surface_mesh.ply"))
 
 
-def test_both_outputs_preserve_stack_and_joint_fusion_accumulates_cross_cycle_evidence(run, tmp_path):
+@pytest.mark.parametrize("archived,include_normals", [(False, False), (True, True)])
+def test_both_outputs_preserve_stack_and_joint_fusion_accumulates_cross_cycle_evidence(run, tmp_path, archived, include_normals):
     s = options(run, tmp_path)
+    s.update(archive_stacked=archived, include_stacked_normals=include_normals)
     # Two frames per cycle cannot independently meet this threshold. Together
     # they must produce a surface, with both red and blue observations counted.
     s["fused_overrides"] = {"weight_threshold": 3.0, "color_min_observations": 3}
@@ -61,6 +63,10 @@ def test_both_outputs_preserve_stack_and_joint_fusion_accumulates_cross_cycle_ev
     report_path, = s["output_root"].glob("*/combined_report.json")
     report = json.loads(report_path.read_text())
     output = report_path.parent
+    if archived:
+        with zipfile.ZipFile(output / "stacked/combined_mesh.zip") as z:
+            assert z.testzip() is None
+            z.extract("combined_mesh.ply", output / "stacked")
     stacked = o3d.io.read_triangle_mesh(str(output / "stacked/combined_mesh.ply"))
     source_rows = json.loads((run / "summary.json").read_text())["scans"]
     offset = face_offset = 0
@@ -69,6 +75,8 @@ def test_both_outputs_preserve_stack_and_joint_fusion_accumulates_cross_cycle_ev
         n, f = len(source.vertices), len(source.triangles)
         np.testing.assert_array_equal(np.asarray(stacked.vertices)[offset:offset+n], source.vertices)
         np.testing.assert_array_equal(np.asarray(stacked.vertex_colors)[offset:offset+n], source.vertex_colors)
+        if include_normals:
+            np.testing.assert_array_equal(np.asarray(stacked.vertex_normals)[offset:offset+n], source.vertex_normals)
         np.testing.assert_array_equal(np.asarray(stacked.triangles)[face_offset:face_offset+f], np.asarray(source.triangles) + offset)
         offset += n; face_offset += f
     assert len(stacked.vertices) == offset and len(stacked.triangles) == face_offset
