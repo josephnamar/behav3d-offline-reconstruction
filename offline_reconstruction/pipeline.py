@@ -207,6 +207,13 @@ def configure_fusion(s):
         "TABLE_PLANE_DOWNSAMPLE": "plane_downsample_m", "TABLE_PLANE_RANSAC_THRESH": "plane_distance_threshold_m",
         "TABLE_PLANE_RANSAC_N": "plane_ransac_points", "TABLE_PLANE_RANSAC_ITERS": "plane_iterations",
         "TABLE_PLANE_UP_AXIS": "plane_up_axis", "TABLE_PLANE_MAX_TILT_DEG": "plane_max_tilt_deg",
+        "C2D_CENTER_CROP_ENABLE": "center_crop", "C2D_CENTER_CROP_WIDTH": "center_crop_width",
+        "C2D_CENTER_CROP_HEIGHT": "center_crop_height", "C2D_CENTER_CROP_APPLY_TO_DEPTH": "center_crop_depth",
+        "CROP_ENABLE": "world_crop", "CROP_MIN": "world_crop_min_m", "CROP_MAX": "world_crop_max_m",
+        "AUTO_OBJECT_CROP_ENABLE": "auto_object_crop", "AUTO_OBJECT_MIN_HEIGHT_M": "object_min_height_m",
+        "AUTO_OBJECT_CLUSTER_EPS_M": "object_cluster_eps_m", "AUTO_OBJECT_CLUSTER_MIN_POINTS": "object_cluster_min_points",
+        "AUTO_OBJECT_NEIGHBOR_MAX_GAP_M": "object_neighbor_max_gap_m", "AUTO_OBJECT_XY_MARGIN_M": "object_xy_margin_m",
+        "AUTO_OBJECT_TOP_MARGIN_M": "object_top_margin_m", "AUTO_OBJECT_TABLE_BELOW_MARGIN_M": "object_table_below_margin_m",
     }
     for attribute, key in mapping.items():
         setattr(fusion, attribute, s[key])

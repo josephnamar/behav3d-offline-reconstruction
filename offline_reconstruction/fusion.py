@@ -210,6 +210,7 @@ class TSDF_Integration():
             rectify_images=False,
             trunc_voxel_multiplier=8.0,
             weight_threshold=3.0,
+            voxel_grid=None,
         ):
         # initialize session and load poses
         self.session = session
@@ -247,7 +248,7 @@ class TSDF_Integration():
         self._apply_depth_bias_in_place()
 
         # initialize VoxelBlockGrid (CPU)
-        self.vbg = o3d.t.geometry.VoxelBlockGrid(
+        self.vbg = voxel_grid if voxel_grid is not None else o3d.t.geometry.VoxelBlockGrid(
             attr_names=('tsdf', 'weight'),
             attr_dtypes=(o3c.float32, o3c.float32),
             attr_channels=((1), (1)),
@@ -490,7 +491,7 @@ class TSDF_Integration():
         _, pcd = self.extract_tsdf_surface_mesh_and_pcd()
         return pcd
 
-    def colorize_tsdf_surface_points(self, pcd, sample_step=1, z_band_m=0.02, min_obs=3):
+    def colorize_tsdf_surface_points(self, pcd, sample_step=1, z_band_m=0.02, min_obs=3, return_statistics=False):
         """Color the input surface and return its sufficiently observed subset.
 
         Unsupported vertices retain neutral gray on the complete mesh; the
@@ -554,6 +555,9 @@ class TSDF_Integration():
 
             accum[ok] += rgb
             obs[ok] += 1
+
+        if return_statistics:
+            return accum, obs
 
         keep = obs >= int(min_obs)
 
@@ -1099,6 +1103,13 @@ def run(
         z_band_m=color_z_band_m,
         min_obs=color_min_obs
     )
+    return finish_reconstruction(tsdf_integration, mesh, pcd_surface, pcd_rgb, conf,
+                                 visualize, mesh_min_component_triangles)
+
+
+def finish_reconstruction(tsdf_integration, mesh, pcd_surface, pcd_rgb, conf,
+                          visualize=False, mesh_min_component_triangles=None):
+    """Apply the shared cleanup/export path to a single-scan or fused surface."""
     # The surface point cloud has the same vertex order as the extracted mesh.
     # Transfer colors before point-only filtering; no vertices/faces are moved
     # or removed just because their color observations are insufficient.

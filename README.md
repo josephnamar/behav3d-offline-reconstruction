@@ -100,6 +100,27 @@ PLY/STL coordinates remain in metres in the robot base frame defined by the save
 
 The script returns exit code 1 if validation or a selected reconstruction fails. `continue_on_error` lets later scans finish after a reconstruction failure; consult `summary.json` and each `result.json` before using partial output. Ctrl+C can leave a run marked `running`, which is not a completed result. A subsequent invocation always creates a separate directory.
 
+## Combine all cycle results into one 3D model
+
+`combine_cycles.py` produces **both outcomes** by default. Edit its SETTINGS block or select a completed reconstruction run on the command line:
+
+```bash
+python combine_cycles.py --input /path/to/results/RUN_ID
+```
+
+On Windows, use `.\.venv\Scripts\python.exe combine_cycles.py --input "C:\Results\RUN_ID"`. The script uses the same Python environment and dependencies as reconstruction.
+
+- **Stacked:** `stacked/combined_mesh.ply` contains every input vertex, triangle and RGB value in the original robot-base coordinates. There is no alignment, smoothing, decimation or merging of overlapping faces. Intermediate surfaces, repeated table surfaces and existing artifacts remain. To reduce file size, vertex normals are omitted by default; viewers can recompute these shading vectors. Set `include_stacked_normals=True` to retain them too. The script streams each mesh into the combined file, so it does not need to load the complete model into memory. A long sequence can still produce a very large final mesh.
+- **Fused:** `fused/tsdf_surface_mesh.ply` is a new joint TSDF reconstruction from every selected cycle's original depth captures and saved poses. It retains calibrated undistortion and the processing settings recorded in that run, accumulates color observations across cycles, then applies the existing crop/cleanup/export workflow. It also writes STL and RGB/confidence point clouds. This mode requires the original raw captures, calibration and aligned images, and verifies that source hashes match the saved run.
+
+Both modes read unpacked results or `artifacts.zip` automatically. Every selected cycle must be complete and use the same coordinate-frame name. This does not establish alignment between separate physical setups that happen to use the same frame name; select cycles from the same setup. The `cycle_names` setting can select a subset. Use `--mode stacked` or `--mode fused` for only one outcome.
+
+For relocated raw data, set `source_root_override` or pass `--source-root /new/path/to/input`; that path replaces the original reconstruction's `input_path` while retaining the nested session/cycle structure. `fused_overrides` allows explicit changes to fusion parameters. Undistortion mode, depth scale and alignment depth limit must agree with the saved aligned images; rerun `reconstruct.py` to change them.
+
+Results go into a new timestamped directory under the combiner's `output_root`, with `combined_report.json`, the effective settings, a log, and separate `stacked`/`fused` folders. The report records input mesh hashes and vertex/triangle ranges for each stacked cycle. Both folders include a lightweight `preview_points.ply` and a PNG using the same camera bounds. **Only these previews are voxel-downsampled**; preview settings do not change either full mesh. The stacked preview is an approximate, incrementally sampled view intended for quick inspection.
+
+Printing is a changing scene. Stacking retains all intermediate print stages. Joint TSDF treats the observations as one scene, so surfaces added, removed or moved between cycles may be blended, suppressed or produce artifacts. It is not automatically a reconstruction of only the final print state, nor a watertight Boolean union of the cycle meshes.
+
 ## Verification and source
 
 ```bash
