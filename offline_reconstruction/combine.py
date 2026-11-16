@@ -274,6 +274,18 @@ def integration_for(scan, settings, grid=None):
     )
 
 
+def cap_history_weight(grid, cap):
+    """Discount accumulated evidence without changing the current TSDF values.
+
+    The next cycle can then move an old surface more readily. This is not a
+    sliding window: surfaces outside later views are not erased.
+    """
+    if cap is not None:
+        # Flatten the shared view: Open3D 0.19's clip kernel cannot handle the
+        # five-dimensional block attribute plus its scalar operands.
+        grid.attribute("weight").reshape((-1,)).clip_(0.0, float(cap))
+
+
 def fuse_captures(root, rows, output, options, scratch, bounds):
     saved = json.loads((root / "settings.json").read_text())["settings"]
     unknown = set(options["fused_overrides"]) - set(saved)
@@ -284,8 +296,11 @@ def fuse_captures(root, rows, output, options, scratch, bounds):
         if settings[key] != saved[key]:
             raise ValueError(f"{key} must match the saved alignment; rerun reconstruct.py to change it.")
     validate_settings(settings)
+    history_cap = options.get("fused_history_weight_cap")
+    if history_cap is not None and history_cap <= settings["weight_threshold"]:
+        raise ValueError("fused_history_weight_cap must exceed weight_threshold so surfaces remain extractable")
     configure_fusion(settings)
-    write_json(output / "fusion_settings.json", settings)
+    write_json(output / "fusion_settings.json", dict(settings, fused_history_weight_cap=history_cap))
     scans, evidence = [], []
     for number, row in enumerate(rows, 1):
         scan = source_scan(row, saved, options["source_root_override"])
@@ -304,6 +319,7 @@ def fuse_captures(root, rows, output, options, scratch, bounds):
             integrator = integration_for(scan, settings, grid)
             integrator.integrate_depths()
             grid = integrator.vbg
+            cap_history_weight(grid, history_cap)
     mesh, surface = integrator.extract_tsdf_surface_mesh_and_pcd()
     if not mesh.has_triangles():
         raise ValueError("Joint TSDF extraction produced no surface.")
@@ -340,7 +356,10 @@ def fuse_captures(root, rows, output, options, scratch, bounds):
     return dict(status="complete", vertices=len(exported.vertices), triangles=len(exported.triangles),
                 file="tsdf_surface_mesh.ply", sha256=digest(output / "tsdf_surface_mesh.ply"),
                 cycles=len(rows), frames=sum(row["frames"] for row in rows), source_files_unchanged=True,
-                geometry="Joint TSDF of all original depth captures; changing surfaces may be blended or suppressed.")
+                history_weight_cap=history_cap, cycle_order=[row["output"] for row in rows],
+                geometry=("Joint TSDF with bounded history weight; later cycles have more influence."
+                          if history_cap is not None else
+                          "Joint TSDF of all original depth captures; changing surfaces may be blended or suppressed."))
 
 
 def execute(options):
@@ -357,6 +376,11 @@ def execute(options):
         raise ValueError("cycle_names must be a list of names")
     if not isinstance(options["fused_overrides"], dict):
         raise ValueError("fused_overrides must be a dictionary")
+    history_cap = options.get("fused_history_weight_cap")
+    if history_cap is not None and (isinstance(history_cap, bool)
+                                   or not isinstance(history_cap, (int, float))
+                                   or not np.isfinite(history_cap) or history_cap <= 0):
+        raise ValueError("fused_history_weight_cap must be None or a positive finite number")
     root, rows, frame = read_run(options["input_run"], options["cycle_names"])
     low = np.min([row["mesh_bounds_min_m"] for row in rows], axis=0)
     high = np.max([row["mesh_bounds_max_m"] for row in rows], axis=0)

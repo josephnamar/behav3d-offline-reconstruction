@@ -21,6 +21,10 @@ SETTINGS = {
     # Undistortion, depth_scale and alignment_depth_max_m must match the saved
     # alignment. Rerun reconstruct.py to change those three settings.
     "fused_overrides": {},
+    # None = ordinary TSDF averaging. Try 8.0 for a print growing between scans:
+    # limit old evidence after each cycle so later observations can change it.
+    # Must exceed weight_threshold. Cycles run in their saved summary order.
+    "fused_history_weight_cap": None,
     "cpu_threads": 4,
     # Preview sampling only: these never simplify the complete stacked mesh.
     "preview_voxel_size_m": 0.004,
@@ -41,6 +45,7 @@ def main(argv=None):
     parser.add_argument("--source-root", type=Path, help="New location of the raw input folder")
     parser.add_argument("--mode", choices=("both", "stacked", "fused"), help="Override which outputs to produce")
     parser.add_argument("--archive-stacked", action="store_true", help="Write stacked/combined_mesh.zip without an unpacked temporary model")
+    parser.add_argument("--history-weight-cap", type=float, help="Limit older TSDF evidence between cycles (e.g. 8 for a growing print)")
     args = parser.parse_args(argv)
     settings = dict(SETTINGS)
     for argument, key in ((args.input, "input_run"), (args.output, "output_root"),
@@ -52,6 +57,8 @@ def main(argv=None):
         settings["make_fused"] = args.mode in ("both", "fused")
     if args.archive_stacked:
         settings["archive_stacked"] = True
+    if args.history_weight_cap is not None:
+        settings["fused_history_weight_cap"] = args.history_weight_cap
     for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(key, str(settings["cpu_threads"]))
     try:

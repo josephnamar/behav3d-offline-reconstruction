@@ -120,6 +120,16 @@ Both modes read unpacked results or `artifacts.zip` automatically. Every selecte
 
 For relocated raw data, set `source_root_override` or pass `--source-root /new/path/to/input`; that path replaces the original reconstruction's `input_path` while retaining the nested session/cycle structure. `fused_overrides` allows explicit changes to fusion parameters. Undistortion mode, depth scale and alignment depth limit must agree with the saved aligned images; rerun `reconstruct.py` to change them.
 
+For a print that **grows between cycles**, ordinary TSDF averaging can suppress later surfaces because earlier views saw empty space there. Try limiting accumulated evidence between cycles:
+
+```bash
+python combine_cycles.py --input /path/to/results/RUN_ID --mode fused --history-weight-cap 8
+```
+
+The equivalent setting is `fused_history_weight_cap=8.0`; the default `None` keeps ordinary averaging. After each cycle, weights above this limit are reduced without changing the current TSDF values. Later observations then have more influence. All selected frames are still processed, and undistortion, extraction threshold, mesh cleanup and RGB accumulation retain their existing settings. This is a geometry experiment, not a new confidence filter or a guarantee of a watertight/final-state model. It can also give recent noise more influence; compare against the ordinary result. Colors still average all depth-consistent observations.
+
+The cap must exceed the extraction `weight_threshold`. Cycles are processed in their saved `summary.json` order, which must run from oldest to newest for this mode; `cycle_names` filters that order without reordering it. The exact order and cap are saved in `combined_report.json`. A cap of 8 improved completeness on the tested 34-cycle growing-print sequence without relaxing the extraction threshold of 3; physical accuracy has not been established.
+
 Results go into a new timestamped directory under the combiner's `output_root`, with `combined_report.json`, the effective settings, a log, and separate `stacked`/`fused` folders. The report records input mesh hashes and vertex/triangle ranges for each stacked cycle. Both folders include a lightweight `preview_points.ply` and a PNG using the same camera bounds. **Only these previews are voxel-downsampled**; preview settings do not change either full mesh. The stacked preview is an approximate, incrementally sampled view intended for quick inspection.
 
 Printing is a changing scene. Stacking retains all intermediate print stages. Joint TSDF treats the observations as one scene, so surfaces added, removed or moved between cycles may be blended, suppressed or produce artifacts. It is not automatically a reconstruction of only the final print state, nor a watertight Boolean union of the cycle meshes.
