@@ -1,0 +1,6 @@
+# Direct dependency versions used for the saved-scan validation.
+numpy==2.4.6
+scipy==1.17.1
+opencv-python==4.13.0.92
+open3d==0.19.0
+PyYAML==6.0.3

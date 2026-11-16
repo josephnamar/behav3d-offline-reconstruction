@@ -1,0 +1,1246 @@
+# TSDF -> high-confidence surface point cloud with RGB
+# PLUS confidence visualization using a conventional colormap gradient (TURBO)
+#
+# Adds:
+# - Per-point confidence = number of valid observations (obs count)
+# - Confidence gradient visualization (TURBO) as a separate point cloud
+# - Cropping and outlier filtering that also keeps confidence aligned
+#
+# Outputs:
+# - tsdf_surface_rgb_colored.ply
+# - tsdf_surface_confidence_colored.ply
+# - tsdf_surface_mesh.ply
+#
+# Notes:
+# - Confidence here is an observation-count proxy (robust and practical).
+# - Colormap is OpenCV COLORMAP_TURBO (conventional, perceptually strong).
+
+# local utils
+import json
+from pathlib import Path
+
+import numpy as np
+import cv2
+import open3d as o3d
+import open3d.core as o3c
+from scipy.spatial.transform import Rotation as R
+
+from .utils.session import Session
+from .utils.manifest import read_manifest, load_robot_poses, construct_image_paths
+from .utils.intrinsics import load_intrinsics, intrinsics_matrix
+from .utils.extrinsics import load_extrinsics
+from .utils.image_loader import load_images
+from .utils.integration import visualize_camera_poses
+from .utils.rectification import rectify_images as rectify_image_batch, validate_alignment_metadata, aligned_image_paths
+
+DEFAULT_SESSION_PATH = "."
+DEFAULT_SCAN_FOLDER = "scan_yaml_targets"
+SESSION_PATH = DEFAULT_SESSION_PATH
+scan_folder = DEFAULT_SCAN_FOLDER
+
+
+def _resolve_reconstruct_scan_dir(session_path: str, scan_folder_name: str) -> Path:
+    scan = str(scan_folder_name or "").strip() or DEFAULT_SCAN_FOLDER
+    return (Path(session_path).expanduser().resolve() / scan / "reconstruct").resolve()
+
+
+output_folder = _resolve_reconstruct_scan_dir(SESSION_PATH, scan_folder)
+C2D_DIR = output_folder / "color_in_depth"
+C2D_GLOB = "color_in_depth*.png"
+
+# Optional post-processing on color_in_depth images before colorization.
+# This erodes the non-zero valid mask and zeroes out edge pixels.
+C2D_ERODE_ENABLE = False
+C2D_ERODE_KERNEL_SIZE = 500
+C2D_ERODE_ITERATIONS = 3
+C2D_ERODE_SHAPE = "cross"  # "ellipse", "rect", "cross"
+# Optional center crop on color_in_depth images. Outside region is zeroed.
+C2D_CENTER_CROP_ENABLE = True
+C2D_CENTER_CROP_WIDTH = 270   # pixels, None keeps full width
+C2D_CENTER_CROP_HEIGHT = 290  # pixels, None keeps full height
+# If True, the same center crop mask is also applied to depth images before TSDF integration.
+C2D_CENTER_CROP_APPLY_TO_DEPTH = True
+# If enabled, only count an observation when the projected color_in_depth pixel is still valid.
+# This makes erosion affect point retention (not just point color).
+C2D_REQUIRE_VALID_MASK_FOR_OBS = True
+# Fixed additive depth correction applied before TSDF integration.
+# Note: this is in camera-depth units. Negative pulls points closer to camera.
+DEPTH_BIAS_MM = -5.1
+
+# ----------------------------
+# Final output filtering parameters
+# ----------------------------
+
+# Crop box in WORLD coordinates (base frame)
+CROP_ENABLE = False
+CROP_MIN = np.array([-0.25, -1.1, -1.0], dtype=np.float64)  # meters
+CROP_MAX = np.array([ 0.3,  -0.65,  0.5], dtype=np.float64)  # meters
+
+# Adaptive final crop. The table plane is used only to identify points above
+# the support surface and set the crop height; the table patch inside the
+# resulting XY footprint remains in the exported mesh.
+AUTO_OBJECT_CROP_ENABLE = False
+AUTO_OBJECT_MIN_HEIGHT_M = 0.010
+AUTO_OBJECT_CLUSTER_EPS_M = 0.020
+AUTO_OBJECT_CLUSTER_MIN_POINTS = 30
+# Keep separate object clusters whose XY footprints are this close to the
+# largest cluster. This retains small neighboring objects without admitting
+# distant table-edge artifacts into the adaptive crop.
+AUTO_OBJECT_NEIGHBOR_MAX_GAP_M = 0.100
+AUTO_OBJECT_XY_MARGIN_M = 0.020
+AUTO_OBJECT_TOP_MARGIN_M = 0.010
+AUTO_OBJECT_TABLE_BELOW_MARGIN_M = 0.010
+
+# Outlier removal method: "none", "statistical", "radius"
+OUTLIER_METHOD = "statistical"
+
+# Mesh export cleanup. TSDF edge noise commonly produces many tiny disconnected
+# triangle islands; remove those without smoothing away object detail.
+MESH_REMOVE_SMALL_COMPONENTS = True
+MESH_MIN_COMPONENT_TRIANGLES = 100
+
+# Statistical outlier params
+OUTLIER_NB_NEIGHBORS = 35
+OUTLIER_STD_RATIO = 1.5
+
+# Radius outlier params
+OUTLIER_NB_POINTS = 12
+OUTLIER_RADIUS = 0.02  # meters
+
+# Confidence visualization params
+CONF_CLIP_PERCENTILE = 100  # clip very high obs counts for better contrast
+CONF_COLORMAP = cv2.COLORMAP_TURBO  # conventional gradient for confidence
+
+# ----------------------------
+# Run mode
+# ----------------------------
+# "table": horizontal surface workflow (fit/load plane + optional slicing)
+# "environment": full scene (no plane generation)
+RUN_MODE = "table"  # "table" or "environment"
+
+# Table mode options
+TABLE_MODE_PLANE = "fit"  # "fit" to save plane, "load" to reuse
+TABLE_MODE_SLICE = False  # slice using table plane
+TABLE_MODE_VIS = True
+
+# ----------------------------
+# Table plane extraction + slicing (for removing the horizontal table)
+# ----------------------------
+
+
+def _normalize_device(device: str) -> str:
+    if not device:
+        return "CPU:0"
+    d = device.strip()
+    if not d:
+        return "CPU:0"
+    d_lower = d.lower()
+    if d_lower in ("cpu", "cpu:0"):
+        return "CPU:0"
+    if d_lower in ("gpu", "cuda", "cuda:0", "gpu:0"):
+        return "CUDA:0"
+    return d
+
+
+def _validate_device(device: str) -> str:
+    d_lower = device.lower()
+    if d_lower.startswith("cuda"):
+        if not o3c.cuda.is_available():
+            print("Warning: Open3D CUDA is not available. Falling back to CPU:0")
+            return "CPU:0"
+    try:
+        _ = o3c.Device(device)
+        return device
+    except Exception as exc:
+        print(f"Warning: failed to use device '{device}': {exc}. Falling back to CPU:0")
+        return "CPU:0"
+
+# Plane mode: "fit" (estimate + save), "load" (reuse), "off"
+TABLE_PLANE_MODE = "fit"
+TABLE_PLANE_FILE = output_folder / "table_plane.json"
+
+# RANSAC params for plane fitting
+TABLE_PLANE_DOWNSAMPLE = 0.005  # meters, 0 to disable
+TABLE_PLANE_RANSAC_THRESH = 0.004
+TABLE_PLANE_RANSAC_N = 3
+TABLE_PLANE_RANSAC_ITERS = 2000
+
+# Orientation hint (used to keep "above" consistent)
+TABLE_PLANE_UP_AXIS = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+TABLE_PLANE_MAX_TILT_DEG = 25.0  # warn if plane is far from up
+
+# Slice points relative to the plane (leave False to keep all TSDF points)
+TABLE_SLICE_ENABLE = False
+TABLE_SLICE_KEEP_SIDE = "above"  # "above" or "below"
+TABLE_SLICE_MARGIN = 0.005  # meters
+
+# Plane visualization
+TABLE_PLANE_VIS_ENABLE = True
+TABLE_PLANE_VIS_COLOR = (0.2, 0.4, 1.0)
+TABLE_PLANE_VIS_SCALE = 1.2
+TABLE_PLANE_VIS_GRID = 25 # number of inner grid lines per axis
+TABLE_PLANE_NORMAL_COLOR = (1.0, 0.2, 0.2)
+TABLE_PLANE_NORMAL_SCALE = 0.25
+TABLE_PLANE_NORMAL_RADIUS = 0.002  # meters; 0 uses a thin line
+
+if RUN_MODE == "table":
+    TABLE_PLANE_MODE = TABLE_MODE_PLANE
+    TABLE_SLICE_ENABLE = TABLE_MODE_SLICE
+    TABLE_PLANE_VIS_ENABLE = TABLE_MODE_VIS
+elif RUN_MODE == "environment":
+    TABLE_PLANE_MODE = "off"
+    TABLE_SLICE_ENABLE = False
+    TABLE_PLANE_VIS_ENABLE = False
+else:
+    raise ValueError(f"Unknown RUN_MODE: {RUN_MODE}")
+
+
+class TSDF_Integration():
+
+    def __init__(
+            self,
+            session,
+            voxel_size=1/512,
+            block_count=10000,
+            block_resolution=12,
+            depth_max=0.9,
+            depth_scale=1000.0,
+            depth_bias_m=0.0,
+            device='CPU:0',
+            rectify_images=False,
+            trunc_voxel_multiplier=8.0,
+            weight_threshold=3.0,
+        ):
+        # initialize session and load poses
+        self.session = session
+        self.manifest = read_manifest(self.session.path, self.session._scan_folder)
+        self.T_base_tool0_list = load_robot_poses(self.manifest)
+        self.T_tool0_ir = np.asarray(
+            load_extrinsics(self.session._camera_extrinsics_path, frame_key="T_tool0_ir"),
+            dtype=np.float64
+        )
+        self.T_base_ir = [T_base_tool0 @ self.T_tool0_ir for T_base_tool0 in self.T_base_tool0_list]
+
+        # load depth images
+        self.image_paths = construct_image_paths(self.manifest, self.session, image_type="depth")
+        self.images = load_images(self.image_paths, image_type="depth", library="cv2")
+
+        # load intrinsics
+        self.device = o3c.Device(device)
+        self.width, self.height, self.K, self.D = load_intrinsics(self.session.depth_intrinsics_path)
+        self.pinhole_matrix = intrinsics_matrix(self.width, self.height, self.K)
+        if rectify_images:
+            self.images = rectify_image_batch(self.images, self.K, self.D, (self.width, self.height), depth=True)
+        self._postprocess_depth_images_in_place()
+        validate_alignment_metadata(C2D_DIR, session, len(self.images), rectified=bool(rectify_images))
+
+        # TSDF parameters
+        self.trunc_voxel_multiplier = trunc_voxel_multiplier
+        self.weight_threshold = weight_threshold
+        self.voxel_size = voxel_size
+        self.block_count = block_count
+        self.block_resolution = block_resolution
+        self.depth_max = float(depth_max)
+        self.depth_scale = float(depth_scale)
+        self.depth_bias_m = float(depth_bias_m)
+
+        self._apply_depth_bias_in_place()
+
+        # initialize VoxelBlockGrid (CPU)
+        self.vbg = o3d.t.geometry.VoxelBlockGrid(
+            attr_names=('tsdf', 'weight'),
+            attr_dtypes=(o3c.float32, o3c.float32),
+            attr_channels=((1), (1)),
+            voxel_size=self.voxel_size,
+            block_resolution=self.block_resolution,
+            block_count=self.block_count,
+            device=self.device
+        )
+
+        # load all color_in_depth images found in folder
+        self.color_in_depth, self.color_in_depth_paths = self._load_color_in_depth_images()
+        if len(self.color_in_depth) == 0:
+            raise FileNotFoundError(f"No {C2D_GLOB} found in {C2D_DIR}")
+
+    def _apply_depth_bias_in_place(self):
+        """
+        Apply additive depth bias to raw depth images before TSDF integration.
+        Positive bias increases depth values (pushes points farther from camera).
+        """
+        if abs(self.depth_bias_m) < 1e-12:
+            return
+
+        changed = 0
+        for i, img in enumerate(self.images):
+            if img is None:
+                continue
+
+            if img.dtype == np.uint16:
+                delta = int(round(self.depth_bias_m * self.depth_scale))
+                if delta == 0:
+                    continue
+                arr = img.astype(np.int32, copy=False)
+                mask = arr > 0
+                if not np.any(mask):
+                    continue
+                arr[mask] = np.clip(arr[mask] + delta, 1, 65535)
+                self.images[i] = arr.astype(np.uint16)
+                changed += 1
+                continue
+
+            arr = img.astype(np.float32, copy=False)
+            mask = arr > 0.0
+            if not np.any(mask):
+                continue
+            arr[mask] = np.maximum(arr[mask] + float(self.depth_bias_m), 0.0)
+            self.images[i] = arr
+            changed += 1
+
+        if changed > 0:
+            print(
+                f"Applied depth bias before TSDF integration: depth_bias_m={self.depth_bias_m:.6f} "
+                f"(~{self.depth_bias_m * 1000.0:.3f} mm) on {changed}/{len(self.images)} depth frames"
+            )
+
+    def _load_color_in_depth_images(self):
+        if not C2D_DIR.exists():
+            raise FileNotFoundError(f"color_in_depth folder not found: {C2D_DIR}")
+
+        paths = aligned_image_paths(C2D_DIR, len(self.images))
+
+        imgs = []
+        valid_pixels_before = 0
+        valid_pixels_after = 0
+        for p in paths:
+            im = cv2.imread(str(p), cv2.IMREAD_COLOR)
+            if im is None:
+                raise RuntimeError(f"Failed reading: {p}")
+            if im.shape[:2] != (self.height, self.width):
+                raise ValueError(f"Aligned image dimensions do not match depth calibration: {p}")
+            valid_pixels_before += int(np.count_nonzero(np.any(im > 0, axis=2)))
+            im = self._postprocess_color_in_depth(im)
+            valid_pixels_after += int(np.count_nonzero(np.any(im > 0, axis=2)))
+            imgs.append(im)
+
+        print(f"Loaded {len(imgs)} color_in_depth frames from {C2D_DIR}")
+        if C2D_CENTER_CROP_ENABLE or C2D_ERODE_ENABLE:
+            removed = valid_pixels_before - valid_pixels_after
+            print(
+                "Applied color_in_depth postprocess "
+                f"(center_crop={C2D_CENTER_CROP_ENABLE}, "
+                f"crop_w={C2D_CENTER_CROP_WIDTH}, crop_h={C2D_CENTER_CROP_HEIGHT}, "
+                f"erode={C2D_ERODE_ENABLE}, shape={C2D_ERODE_SHAPE}, "
+                f"kernel={C2D_ERODE_KERNEL_SIZE}, iters={C2D_ERODE_ITERATIONS}) "
+                f"valid_before={valid_pixels_before}, valid_after={valid_pixels_after}, removed_valid_pixels={removed}"
+            )
+        return imgs, paths
+
+    @staticmethod
+    def _center_crop_bounds(h, w):
+        crop_w = w if C2D_CENTER_CROP_WIDTH is None else int(C2D_CENTER_CROP_WIDTH)
+        crop_h = h if C2D_CENTER_CROP_HEIGHT is None else int(C2D_CENTER_CROP_HEIGHT)
+        crop_w = max(1, min(crop_w, w))
+        crop_h = max(1, min(crop_h, h))
+
+        x0 = (w - crop_w) // 2
+        y0 = (h - crop_h) // 2
+        x1 = x0 + crop_w
+        y1 = y0 + crop_h
+        return x0, y0, x1, y1
+
+    @staticmethod
+    def _apply_center_crop_mask(img):
+        if not C2D_CENTER_CROP_ENABLE:
+            return img
+
+        h, w = img.shape[:2]
+        x0, y0, x1, y1 = TSDF_Integration._center_crop_bounds(h, w)
+        out = np.zeros_like(img)
+        out[y0:y1, x0:x1] = img[y0:y1, x0:x1]
+        return out
+
+    def _postprocess_depth_images_in_place(self):
+        if not (C2D_CENTER_CROP_ENABLE and C2D_CENTER_CROP_APPLY_TO_DEPTH):
+            return
+        if len(self.images) == 0:
+            return
+
+        nonzero_before = 0
+        nonzero_after = 0
+        for i, depth_u16 in enumerate(self.images):
+            if depth_u16 is None:
+                continue
+            nonzero_before += int(np.count_nonzero(depth_u16))
+            cropped = self._apply_center_crop_mask(depth_u16)
+            nonzero_after += int(np.count_nonzero(cropped))
+            self.images[i] = cropped
+
+        sample_h, sample_w = self.images[0].shape[:2]
+        x0, y0, x1, y1 = self._center_crop_bounds(sample_h, sample_w)
+        removed = nonzero_before - nonzero_after
+        print(
+            "Applied center crop to depth images before TSDF integration "
+            f"(x0={x0}, y0={y0}, x1={x1}, y1={y1}, "
+            f"crop_w={x1 - x0}, crop_h={y1 - y0}) "
+            f"nonzero_before={nonzero_before}, nonzero_after={nonzero_after}, removed_nonzero={removed}"
+        )
+
+    @staticmethod
+    def _postprocess_color_in_depth(color_bgr):
+        out = TSDF_Integration._apply_center_crop_mask(color_bgr)
+        if not C2D_ERODE_ENABLE:
+            return out
+
+        k = max(1, int(C2D_ERODE_KERNEL_SIZE))
+        iters = max(1, int(C2D_ERODE_ITERATIONS))
+        shape_name = str(C2D_ERODE_SHAPE).lower().strip()
+        shape_map = {
+            "ellipse": cv2.MORPH_ELLIPSE,
+            "rect": cv2.MORPH_RECT,
+            "cross": cv2.MORPH_CROSS,
+        }
+        if shape_name not in shape_map:
+            raise ValueError(f"Unknown C2D_ERODE_SHAPE: {C2D_ERODE_SHAPE}")
+
+        valid = np.any(out > 0, axis=2).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(shape_map[shape_name], (k, k))
+        eroded = cv2.erode(valid, kernel, iterations=iters)
+
+        out_eroded = out.copy()
+        out_eroded[eroded == 0] = 0
+        return out_eroded
+
+    def _tensorize_robot_poses(self):
+        cpu = o3c.Device("CPU:0")
+        self.T_base_ir_tensors = []
+        for T in self.T_base_ir:
+            self.T_base_ir_tensors.append(o3c.Tensor(T, o3c.Dtype.Float64, cpu))
+        return self.T_base_ir_tensors
+
+    def _tensorize_intrinsics(self):
+        self.K_cpu = o3c.Tensor(
+            np.asarray(self.pinhole_matrix.intrinsic_matrix),
+            o3c.Dtype.Float64,
+            self.device
+        )
+        return self.K_cpu
+
+    def _tensorize_depth_images(self):
+        self.depth_tensors = []
+        for img in self.images:
+            self.depth_tensors.append(o3c.Tensor(img, o3c.Dtype.UInt16, self.device))
+        return self.depth_tensors
+
+    def integrate_depths(self):
+        self._tensorize_robot_poses()
+        self._tensorize_intrinsics()
+        self._tensorize_depth_images()
+
+        for i, depth_tensor in enumerate(self.depth_tensors):
+            T_base_ir_cpu = self.T_base_ir_tensors[i]
+            Tcw_cpu = o3c.Tensor(
+                np.linalg.inv(T_base_ir_cpu.numpy()),
+                o3c.Dtype.Float64,
+                self.device
+            )
+
+            depth_img_t = o3d.t.geometry.Image(depth_tensor)
+            block_coords = self.vbg.compute_unique_block_coordinates(
+                depth_img_t,
+                self.K_cpu,
+                Tcw_cpu,
+                self.depth_scale,
+                self.depth_max,
+                self.trunc_voxel_multiplier,
+            )
+
+            self.vbg.integrate(
+                block_coords,
+                depth_img_t,
+                self.K_cpu,
+                Tcw_cpu,
+                self.depth_scale,
+                self.depth_max,
+                self.trunc_voxel_multiplier,
+            )
+            print(f"Integrated depth image {i+1}/{len(self.depth_tensors)}")
+
+        print("TSDF Integration complete.")
+        return True
+
+    def extract_tsdf_surface_mesh_and_pcd(self):
+        try:
+            mesh = self.vbg.extract_triangle_mesh(weight_threshold=self.weight_threshold).to_legacy()
+        except RuntimeError as exc:
+            # Open3D 0.19 can raise during conversion of an empty tensor mesh.
+            if "Tensor has shape {0}" in str(exc):
+                raise ValueError("TSDF produced no mesh. Check poses, depth range and weight_threshold.") from exc
+            raise
+        mesh.compute_vertex_normals()
+
+        pts = np.asarray(mesh.vertices, dtype=np.float64)
+        nrm = np.asarray(mesh.vertex_normals, dtype=np.float64)
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        pcd.normals = o3d.utility.Vector3dVector(nrm)
+        return mesh, pcd
+
+    def extract_tsdf_surface_point_cloud(self):
+        _, pcd = self.extract_tsdf_surface_mesh_and_pcd()
+        return pcd
+
+    def colorize_tsdf_surface_points(self, pcd, sample_step=1, z_band_m=0.02, min_obs=3):
+        """Color the input surface and return its sufficiently observed subset.
+
+        Unsupported vertices retain neutral gray on the complete mesh; the
+        returned RGB point cloud keeps the existing observation-count filter.
+        """
+        pts_w = np.asarray(pcd.points, dtype=np.float64)
+        N = pts_w.shape[0]
+        pts_h = np.concatenate([pts_w, np.ones((N, 1), dtype=np.float64)], axis=1)
+
+        fx, fy = float(self.K[0, 0]), float(self.K[1, 1])
+        cx, cy = float(self.K[0, 2]), float(self.K[1, 2])
+        H, W = self.images[0].shape[:2]
+
+        n_frames = min(len(self.images), len(self.T_base_ir), len(self.color_in_depth))
+
+        accum = np.zeros((N, 3), dtype=np.float64)
+        obs = np.zeros((N,), dtype=np.int32)
+        rejected_by_c2d_mask = 0
+
+        for i in range(0, n_frames, sample_step):
+            T_base_ir = self.T_base_ir[i]
+            T_ir_base = np.linalg.inv(T_base_ir)
+
+            X_ir = (T_ir_base @ pts_h.T).T
+            X = X_ir[:, 0]
+            Y = X_ir[:, 1]
+            Z = X_ir[:, 2]
+
+            valid = Z > 0
+            u = (X / Z) * fx + cx
+            v = (Y / Z) * fy + cy
+
+            ui = np.round(u).astype(np.int32)
+            vi = np.round(v).astype(np.int32)
+
+            inb = (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
+            valid = valid & inb
+            if not np.any(valid):
+                continue
+
+            depth_m = self.images[i].astype(np.float32) / self.depth_scale
+            z_obs = depth_m[vi[valid], ui[valid]]
+
+            ok = valid.copy()
+            ok[valid] = (z_obs > 0) & (z_obs < self.depth_max) & (np.abs(z_obs - Z[valid]) < z_band_m)
+
+            if not np.any(ok):
+                continue
+
+            if C2D_REQUIRE_VALID_MASK_FOR_OBS:
+                valid_color_mask = np.any(self.color_in_depth[i] > 0, axis=2)
+                c2d_ok = np.zeros_like(ok, dtype=bool)
+                c2d_ok[ok] = valid_color_mask[vi[ok], ui[ok]]
+                rejected_by_c2d_mask += int(np.count_nonzero(ok & ~c2d_ok))
+                ok = c2d_ok
+                if not np.any(ok):
+                    continue
+
+            bgr = self.color_in_depth[i][vi[ok], ui[ok], :].astype(np.float64) / 255.0
+            rgb = bgr[:, ::-1]
+
+            accum[ok] += rgb
+            obs[ok] += 1
+
+        keep = obs >= int(min_obs)
+
+        colors = np.full((N, 3), 0.8, dtype=np.float64)
+        colors[keep] = accum[keep] / obs[keep][:, None]
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        pcd_out = o3d.geometry.PointCloud()
+        pcd_out.points = o3d.utility.Vector3dVector(pts_w[keep])
+        if pcd.has_normals():
+            nrm = np.asarray(pcd.normals, dtype=np.float64)
+            pcd_out.normals = o3d.utility.Vector3dVector(nrm[keep])
+        pcd_out.colors = o3d.utility.Vector3dVector(colors[keep])
+
+        conf = obs[keep].astype(np.float64)
+
+        if C2D_REQUIRE_VALID_MASK_FOR_OBS:
+            print(f"Rejected projected observations by color_in_depth valid mask: {rejected_by_c2d_mask}")
+        print(f"High-confidence points kept: {np.count_nonzero(keep)} / {N}  (min_obs={min_obs})")
+        return pcd_out, conf
+
+    # ----------------------------
+    # Crop + outlier filtering that preserves confidence alignment
+    # ----------------------------
+    def crop_pcd_aabb_with_conf(self, pcd, conf, aabb_min, aabb_max):
+        pts = np.asarray(pcd.points, dtype=np.float64)
+        m = (
+            (pts[:, 0] >= aabb_min[0]) & (pts[:, 0] <= aabb_max[0]) &
+            (pts[:, 1] >= aabb_min[1]) & (pts[:, 1] <= aabb_max[1]) &
+            (pts[:, 2] >= aabb_min[2]) & (pts[:, 2] <= aabb_max[2])
+        )
+        ind = np.where(m)[0].astype(np.int64)
+        pcd2 = pcd.select_by_index(ind)
+        conf2 = conf[ind]
+        return pcd2, conf2
+
+    def filter_outliers_with_conf(self, pcd, conf,
+                                  method="statistical",
+                                  nb_neighbors=30,
+                                  std_ratio=1.5,
+                                  nb_points=12,
+                                  radius=0.02):
+        method = (method or "none").lower().strip()
+        if method == "none":
+            return pcd, conf
+
+        if method == "statistical":
+            _, ind = pcd.remove_statistical_outlier(
+                nb_neighbors=int(nb_neighbors),
+                std_ratio=float(std_ratio)
+            )
+            ind = np.asarray(ind, dtype=np.int64)
+            return pcd.select_by_index(ind), conf[ind]
+
+        if method == "radius":
+            _, ind = pcd.remove_radius_outlier(
+                nb_points=int(nb_points),
+                radius=float(radius)
+            )
+            ind = np.asarray(ind, dtype=np.int64)
+            return pcd.select_by_index(ind), conf[ind]
+
+        raise ValueError(f"Unknown OUTLIER_METHOD: {method}")
+
+    # ----------------------------
+    # Confidence gradient visualization (TURBO colormap)
+    # ----------------------------
+    def make_confidence_colored_pcd(self, pcd, conf, clip_percentile=95, cv_colormap=cv2.COLORMAP_TURBO):
+        if conf is None or len(conf) == 0 or len(pcd.points) == 0:
+            return pcd
+        conf = conf.astype(np.float64)
+        vmax = float(np.percentile(conf, clip_percentile))
+        vmax = max(vmax, 1.0)
+
+        norm = np.clip(conf / vmax, 0.0, 1.0)
+        img = (norm * 255.0).astype(np.uint8).reshape(-1, 1)  # (N,1)
+
+        bgr = cv2.applyColorMap(img, cv_colormap).reshape(-1, 3).astype(np.float64) / 255.0
+        rgb = bgr[:, ::-1]
+
+        pcd_conf = o3d.geometry.PointCloud()
+        pcd_conf.points = pcd.points
+        if pcd.has_normals():
+            pcd_conf.normals = pcd.normals
+        pcd_conf.colors = o3d.utility.Vector3dVector(rgb)
+        return pcd_conf
+
+
+def _normalize_plane(plane_model):
+    plane_model = np.asarray(plane_model, dtype=np.float64).reshape(4)
+    n = plane_model[:3]
+    norm = np.linalg.norm(n)
+    if norm == 0:
+        raise ValueError("Plane normal is zero")
+    return plane_model / norm
+
+
+def _fit_table_plane(pcd, distance_threshold, ransac_n, num_iterations,
+                     downsample=0.0, up_axis=None, max_tilt_deg=None):
+    pcd_fit = pcd
+    if downsample and downsample > 0:
+        pcd_fit = pcd.voxel_down_sample(float(downsample))
+
+    plane_model, inliers = pcd_fit.segment_plane(
+        distance_threshold=float(distance_threshold),
+        ransac_n=int(ransac_n),
+        num_iterations=int(num_iterations)
+    )
+    plane_model = _normalize_plane(plane_model)
+
+    n = plane_model[:3]
+    if up_axis is not None:
+        up_axis = np.asarray(up_axis, dtype=np.float64)
+        up_norm = np.linalg.norm(up_axis)
+        if up_norm > 0:
+            up_axis = up_axis / up_norm
+            if np.dot(n, up_axis) < 0:
+                plane_model = -plane_model
+                n = -n
+            if max_tilt_deg is not None:
+                ang = np.degrees(np.arccos(np.clip(np.dot(n, up_axis), -1.0, 1.0)))
+                if ang > float(max_tilt_deg):
+                    print(f"Warning: plane tilt {ang:.1f} deg exceeds {max_tilt_deg} deg")
+
+    print(f"Table plane model (a,b,c,d): {plane_model.tolist()}")
+    print(f"Table plane inliers: {len(inliers)} / {len(pcd_fit.points)}")
+    return plane_model
+
+
+def _save_plane(path, plane_model):
+    payload = {"plane_model": plane_model.tolist()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2))
+
+
+def _load_plane(path):
+    data = json.loads(path.read_text())
+    plane = np.asarray(data["plane_model"], dtype=np.float64)
+    return _normalize_plane(plane)
+
+
+def _slice_pcd_by_plane(pcd, conf, plane_model, keep_side="above", margin=0.0):
+    plane_model = _normalize_plane(plane_model)
+    n = plane_model[:3]
+    d = plane_model[3]
+
+    pts = np.asarray(pcd.points, dtype=np.float64)
+    dist = pts @ n + d
+
+    keep_side = (keep_side or "above").lower().strip()
+    margin = float(margin)
+    if keep_side == "above":
+        m = dist > margin
+    elif keep_side == "below":
+        m = dist < -margin
+    else:
+        raise ValueError(f"Unknown TABLE_SLICE_KEEP_SIDE: {keep_side}")
+
+    ind = np.where(m)[0].astype(np.int64)
+    pcd2 = pcd.select_by_index(ind)
+    conf2 = conf[ind] if conf is not None else None
+    return pcd2, conf2
+
+
+def _clean_mesh_for_export(mesh, min_component_triangles=None):
+    """Remove invalid geometry and small disconnected TSDF fragments."""
+    minimum = MESH_MIN_COMPONENT_TRIANGLES if min_component_triangles is None else int(min_component_triangles)
+    if minimum < 0:
+        raise ValueError("mesh_min_component_triangles must be nonnegative")
+    # Vertex merging can itself create degenerate/duplicate triangles.
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+
+    if MESH_REMOVE_SMALL_COMPONENTS and len(mesh.triangles) > 0:
+        triangle_clusters, cluster_n_triangles, _cluster_area = (
+            mesh.cluster_connected_triangles()
+        )
+        triangle_clusters = np.asarray(triangle_clusters, dtype=np.int64)
+        cluster_n_triangles = np.asarray(cluster_n_triangles, dtype=np.int64)
+        remove_cluster = cluster_n_triangles < minimum
+        remove_triangles = remove_cluster[triangle_clusters]
+        removed = int(np.count_nonzero(remove_triangles))
+        if removed > 0:
+            mesh.remove_triangles_by_mask(remove_triangles)
+            mesh.remove_unreferenced_vertices()
+            print(
+                "Mesh cleanup removed "
+                f"{removed} triangles from {int(np.count_nonzero(remove_cluster))} "
+                f"components smaller than {minimum} triangles"
+            )
+
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def _auto_object_crop_bounds(
+    pcd,
+    plane_model,
+    *,
+    min_height_m,
+    cluster_eps_m,
+    cluster_min_points,
+    neighbor_max_gap_m,
+    xy_margin_m,
+    top_margin_m,
+    table_below_margin_m,
+):
+    """Estimate an object AABB while keeping its underlying table patch."""
+    plane_model = _normalize_plane(plane_model)
+    pts = np.asarray(pcd.points, dtype=np.float64)
+    if pts.shape[0] == 0:
+        raise ValueError("Cannot estimate adaptive crop from an empty point cloud.")
+
+    signed_height = pts @ plane_model[:3] + plane_model[3]
+    candidates = pts[signed_height > float(min_height_m)]
+    if candidates.shape[0] < max(3, int(cluster_min_points)):
+        raise ValueError(
+            "Too few points above the fitted table for adaptive crop: "
+            f"{candidates.shape[0]}"
+        )
+
+    candidate_pcd = o3d.geometry.PointCloud()
+    candidate_pcd.points = o3d.utility.Vector3dVector(candidates)
+    labels = np.asarray(
+        candidate_pcd.cluster_dbscan(
+            eps=float(cluster_eps_m),
+            min_points=int(cluster_min_points),
+            print_progress=False,
+        ),
+        dtype=np.int64,
+    )
+    valid_labels = labels[labels >= 0]
+    selected_labels = []
+    cluster_gaps = {}
+    if valid_labels.size == 0:
+        object_pts = candidates
+        selected_label = None
+    else:
+        cluster_ids, cluster_counts = np.unique(valid_labels, return_counts=True)
+        selected_label = int(cluster_ids[int(np.argmax(cluster_counts))])
+        primary_pts = candidates[labels == selected_label]
+        primary_min_xy = np.min(primary_pts[:, :2], axis=0)
+        primary_max_xy = np.max(primary_pts[:, :2], axis=0)
+        for cluster_id in cluster_ids:
+            cluster_id = int(cluster_id)
+            cluster_pts = candidates[labels == cluster_id]
+            cluster_min_xy = np.min(cluster_pts[:, :2], axis=0)
+            cluster_max_xy = np.max(cluster_pts[:, :2], axis=0)
+            axis_gap = np.maximum(
+                np.maximum(primary_min_xy - cluster_max_xy, cluster_min_xy - primary_max_xy),
+                0.0,
+            )
+            gap = float(np.linalg.norm(axis_gap))
+            cluster_gaps[cluster_id] = gap
+            if gap <= max(0.0, float(neighbor_max_gap_m)):
+                selected_labels.append(cluster_id)
+        object_pts = candidates[np.isin(labels, selected_labels)]
+
+    # Recover nearby disconnected pieces belonging to the same object footprint.
+    xy_margin = max(0.0, float(xy_margin_m))
+    seed_min_xy = np.min(object_pts[:, :2], axis=0) - xy_margin
+    seed_max_xy = np.max(object_pts[:, :2], axis=0) + xy_margin
+    nearby = (
+        (candidates[:, 0] >= seed_min_xy[0])
+        & (candidates[:, 0] <= seed_max_xy[0])
+        & (candidates[:, 1] >= seed_min_xy[1])
+        & (candidates[:, 1] <= seed_max_xy[1])
+    )
+    object_pts = candidates[nearby]
+
+    object_min = np.min(object_pts, axis=0)
+    object_max = np.max(object_pts, axis=0)
+    crop_min_xy = object_min[:2] - xy_margin
+    crop_max_xy = object_max[:2] + xy_margin
+
+    a, b, c, d = [float(v) for v in plane_model]
+    if abs(c) < 1e-6:
+        raise ValueError("Adaptive crop requires a table plane with a non-zero Z component.")
+    table_z = []
+    for x in (crop_min_xy[0], crop_max_xy[0]):
+        for y in (crop_min_xy[1], crop_max_xy[1]):
+            table_z.append(-(a * x + b * y + d) / c)
+
+    crop_min = np.array(
+        [
+            crop_min_xy[0],
+            crop_min_xy[1],
+            min(table_z) - max(0.0, float(table_below_margin_m)),
+        ],
+        dtype=np.float64,
+    )
+    crop_max = np.array(
+        [
+            crop_max_xy[0],
+            crop_max_xy[1],
+            object_max[2] + max(0.0, float(top_margin_m)),
+        ],
+        dtype=np.float64,
+    )
+    print(
+        "Adaptive object crop: "
+        f"primary_cluster={selected_label}, selected_clusters={selected_labels}, "
+        f"cluster_xy_gaps_m={cluster_gaps}, object_points={object_pts.shape[0]}, "
+        f"min={crop_min.tolist()}, max={crop_max.tolist()}, "
+        "table_patch_retained=True"
+    )
+    return crop_min, crop_max
+
+
+def _make_plane_line_set(plane_model, pcd_ref, color=(0.85, 0.85, 0.85), scale=1.2,
+                         normal_color=(1.0, 0.2, 0.2), normal_scale=0.25,
+                         normal_radius=0.0, grid_lines=0):
+    plane_model = _normalize_plane(plane_model)
+    n = plane_model[:3]
+    d = plane_model[3]
+
+    bbox = pcd_ref.get_axis_aligned_bounding_box()
+    center = np.asarray(bbox.get_center(), dtype=np.float64)
+    center = center - (np.dot(n, center) + d) * n
+
+    ext = np.asarray(bbox.get_extent(), dtype=np.float64)
+    size = float(np.max(ext)) * float(scale)
+
+    ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(np.dot(n, ref)) > 0.9:
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    t1 = np.cross(n, ref)
+    t1 = t1 / max(np.linalg.norm(t1), 1e-9)
+    t2 = np.cross(n, t1)
+    t2 = t2 / max(np.linalg.norm(t2), 1e-9)
+
+    half = 0.5 * size
+    corners = np.array([
+        center + ( t1 * half) + ( t2 * half),
+        center + (-t1 * half) + ( t2 * half),
+        center + (-t1 * half) + (-t2 * half),
+        center + ( t1 * half) + (-t2 * half),
+    ], dtype=np.float64)
+
+    points = [c for c in corners]
+    lines = [[0, 1], [1, 2], [2, 3], [3, 0]]
+
+    grid_lines = int(max(0, grid_lines))
+    if grid_lines > 0:
+        for i in range(1, grid_lines + 1):
+            offset = -half + (2.0 * half) * (i / (grid_lines + 1))
+
+            p_a = center + (t1 * offset) + (t2 * half)
+            p_b = center + (t1 * offset) - (t2 * half)
+            idx = len(points)
+            points.extend([p_a, p_b])
+            lines.append([idx, idx + 1])
+
+            p_c = center + (t2 * offset) + (t1 * half)
+            p_d = center + (t2 * offset) - (t1 * half)
+            idx = len(points)
+            points.extend([p_c, p_d])
+            lines.append([idx, idx + 1])
+
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(np.vstack(points))
+    line_set.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
+    line_set.colors = o3d.utility.Vector3dVector(
+        np.tile(np.array(color, dtype=np.float64), (len(lines), 1))
+    )
+
+    normal_len = size * float(normal_scale)
+    if float(normal_radius) > 0:
+        # Cylinder along +Z, centered at origin; rotate to normal and translate.
+        cyl = o3d.geometry.TriangleMesh.create_cylinder(
+            radius=float(normal_radius),
+            height=float(normal_len),
+            resolution=20,
+            split=4
+        )
+        cyl.paint_uniform_color(normal_color)
+        z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        dot = float(np.clip(np.dot(z, n), -1.0, 1.0))
+        if dot < 0.999999:
+            if dot > -0.999999:
+                axis = np.cross(z, n)
+                axis = axis / max(np.linalg.norm(axis), 1e-9)
+                angle = float(np.arccos(dot))
+                R = o3d.geometry.get_rotation_matrix_from_axis_angle(axis * angle)
+                cyl.rotate(R, center=(0.0, 0.0, 0.0))
+            else:
+                R = o3d.geometry.get_rotation_matrix_from_axis_angle(
+                    np.array([1.0, 0.0, 0.0]) * np.pi
+                )
+                cyl.rotate(R, center=(0.0, 0.0, 0.0))
+        cyl.translate(center + n * (0.5 * normal_len))
+        return [line_set, cyl]
+
+    p0 = center
+    p1 = center + n * normal_len
+    normal = o3d.geometry.LineSet()
+    normal.points = o3d.utility.Vector3dVector(np.vstack([p0, p1]))
+    normal.lines = o3d.utility.Vector2iVector(np.array([[0, 1]], dtype=np.int32))
+    normal.colors = o3d.utility.Vector3dVector(
+        np.array([normal_color], dtype=np.float64)
+    )
+    return [line_set, normal]
+
+
+def run(
+    session_path=None,
+    scan_folder_override=None,
+    visualize=True,
+    device=None,
+    center_crop_enable=None,
+    center_crop_width=None,
+    center_crop_height=None,
+    center_crop_apply_to_depth=None,
+    aabb_crop_enable=None,
+    aabb_crop_min=None,
+    aabb_crop_max=None,
+    auto_object_crop_enable=None,
+    auto_object_min_height_m=None,
+    auto_object_cluster_eps_m=None,
+    auto_object_cluster_min_points=None,
+    auto_object_neighbor_max_gap_m=None,
+    auto_object_xy_margin_m=None,
+    auto_object_top_margin_m=None,
+    auto_object_table_below_margin_m=None,
+    rectify_images=False,
+    mesh_min_component_triangles=None,
+    *,
+    output_dir,
+    voxel_size=1/512,
+    block_count=10000,
+    block_resolution=12,
+    depth_max=0.9,
+    depth_scale=1000.0,
+    trunc_voxel_multiplier=8.0,
+    weight_threshold=3.0,
+    color_sample_step=1,
+    color_z_band_m=0.02,
+    color_min_obs=3,
+):
+    global SESSION_PATH, scan_folder, output_folder, C2D_DIR, TABLE_PLANE_FILE
+    global C2D_CENTER_CROP_ENABLE, C2D_CENTER_CROP_WIDTH, C2D_CENTER_CROP_HEIGHT
+    global C2D_CENTER_CROP_APPLY_TO_DEPTH, CROP_ENABLE, CROP_MIN, CROP_MAX
+    global AUTO_OBJECT_CROP_ENABLE, AUTO_OBJECT_MIN_HEIGHT_M
+    global AUTO_OBJECT_CLUSTER_EPS_M, AUTO_OBJECT_CLUSTER_MIN_POINTS
+    global AUTO_OBJECT_NEIGHBOR_MAX_GAP_M
+    global AUTO_OBJECT_XY_MARGIN_M, AUTO_OBJECT_TOP_MARGIN_M
+    global AUTO_OBJECT_TABLE_BELOW_MARGIN_M
+
+    SESSION_PATH = session_path or DEFAULT_SESSION_PATH
+    scan_folder = scan_folder_override or DEFAULT_SCAN_FOLDER
+    output_folder = Path(output_dir)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    C2D_DIR = output_folder / ("color_in_depth_rectified" if rectify_images else "color_in_depth")
+    TABLE_PLANE_FILE = output_folder / "table_plane.json"
+
+    if center_crop_enable is not None:
+        C2D_CENTER_CROP_ENABLE = bool(center_crop_enable)
+    if center_crop_width is not None:
+        w = int(center_crop_width)
+        C2D_CENTER_CROP_WIDTH = None if w <= 0 else w
+    if center_crop_height is not None:
+        h = int(center_crop_height)
+        C2D_CENTER_CROP_HEIGHT = None if h <= 0 else h
+    if center_crop_apply_to_depth is not None:
+        C2D_CENTER_CROP_APPLY_TO_DEPTH = bool(center_crop_apply_to_depth)
+    if aabb_crop_enable is not None:
+        CROP_ENABLE = bool(aabb_crop_enable)
+    if aabb_crop_min is not None:
+        arr = np.asarray(aabb_crop_min, dtype=np.float64).reshape(-1)
+        if arr.shape[0] >= 3:
+            CROP_MIN = np.array([float(arr[0]), float(arr[1]), float(arr[2])], dtype=np.float64)
+    if aabb_crop_max is not None:
+        arr = np.asarray(aabb_crop_max, dtype=np.float64).reshape(-1)
+        if arr.shape[0] >= 3:
+            CROP_MAX = np.array([float(arr[0]), float(arr[1]), float(arr[2])], dtype=np.float64)
+    if auto_object_crop_enable is not None:
+        AUTO_OBJECT_CROP_ENABLE = bool(auto_object_crop_enable)
+    if auto_object_min_height_m is not None:
+        AUTO_OBJECT_MIN_HEIGHT_M = float(auto_object_min_height_m)
+    if auto_object_cluster_eps_m is not None:
+        AUTO_OBJECT_CLUSTER_EPS_M = float(auto_object_cluster_eps_m)
+    if auto_object_cluster_min_points is not None:
+        AUTO_OBJECT_CLUSTER_MIN_POINTS = int(auto_object_cluster_min_points)
+    if auto_object_neighbor_max_gap_m is not None:
+        AUTO_OBJECT_NEIGHBOR_MAX_GAP_M = float(auto_object_neighbor_max_gap_m)
+    if auto_object_xy_margin_m is not None:
+        AUTO_OBJECT_XY_MARGIN_M = float(auto_object_xy_margin_m)
+    if auto_object_top_margin_m is not None:
+        AUTO_OBJECT_TOP_MARGIN_M = float(auto_object_top_margin_m)
+    if auto_object_table_below_margin_m is not None:
+        AUTO_OBJECT_TABLE_BELOW_MARGIN_M = float(auto_object_table_below_margin_m)
+
+    session = Session(SESSION_PATH, scan_folder)
+    device = _validate_device(_normalize_device(device))
+    print(f"Using device: {device}")
+    depth_bias_m = float(DEPTH_BIAS_MM) / 1000.0
+    print(f"Depth bias correction: {depth_bias_m * 1000.0:.3f} mm")
+    print(
+        "Color-in-depth postprocess: "
+        f"center_crop={C2D_CENTER_CROP_ENABLE} (w={C2D_CENTER_CROP_WIDTH}, h={C2D_CENTER_CROP_HEIGHT}, "
+        f"apply_to_depth={C2D_CENTER_CROP_APPLY_TO_DEPTH}), "
+        f"erode={C2D_ERODE_ENABLE} (shape={C2D_ERODE_SHAPE}, "
+        f"kernel={C2D_ERODE_KERNEL_SIZE}, iters={C2D_ERODE_ITERATIONS})"
+    )
+    print(
+        "AABB crop: "
+        f"enabled={CROP_ENABLE}, "
+        f"min={np.asarray(CROP_MIN, dtype=np.float64).tolist()}, "
+        f"max={np.asarray(CROP_MAX, dtype=np.float64).tolist()}"
+    )
+    print(
+        "Adaptive object crop: "
+        f"enabled={AUTO_OBJECT_CROP_ENABLE}, min_height={AUTO_OBJECT_MIN_HEIGHT_M}, "
+        f"cluster_eps={AUTO_OBJECT_CLUSTER_EPS_M}, "
+        f"cluster_min_points={AUTO_OBJECT_CLUSTER_MIN_POINTS}, "
+        f"xy_margin={AUTO_OBJECT_XY_MARGIN_M}, top_margin={AUTO_OBJECT_TOP_MARGIN_M}, "
+        f"table_below_margin={AUTO_OBJECT_TABLE_BELOW_MARGIN_M}"
+    )
+    tsdf_integration = TSDF_Integration(
+        session, device=device, depth_bias_m=depth_bias_m, rectify_images=rectify_images,
+        voxel_size=voxel_size, block_count=block_count, block_resolution=block_resolution,
+        depth_max=depth_max, depth_scale=depth_scale,
+        trunc_voxel_multiplier=trunc_voxel_multiplier, weight_threshold=weight_threshold,
+    )
+    print(f"Number of depth images loaded: {len(tsdf_integration.images)}")
+    print(f"Number of robot poses loaded: {len(tsdf_integration.T_base_tool0_list)}")
+    print(f"Number of color_in_depth loaded: {len(tsdf_integration.color_in_depth)}")
+
+    img = tsdf_integration.images[0]
+    print("Depth range:", np.min(img), np.max(img))
+
+    tsdf_integration.integrate_depths()
+
+    mesh, pcd_surface = tsdf_integration.extract_tsdf_surface_mesh_and_pcd()
+    if len(mesh.triangles) == 0:
+        raise ValueError("TSDF produced no mesh. Check poses, depth range and weight_threshold.")
+    pcd_rgb, conf = tsdf_integration.colorize_tsdf_surface_points(
+        pcd_surface,
+        sample_step=color_sample_step,
+        z_band_m=color_z_band_m,
+        min_obs=color_min_obs
+    )
+    # The surface point cloud has the same vertex order as the extracted mesh.
+    # Transfer colors before point-only filtering; no vertices/faces are moved
+    # or removed just because their color observations are insufficient.
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.asarray(pcd_surface.colors))
+
+    if CROP_ENABLE:
+        pcd_rgb, conf = tsdf_integration.crop_pcd_aabb_with_conf(pcd_rgb, conf, CROP_MIN, CROP_MAX)
+        print(f"After crop: {len(pcd_rgb.points)} points")
+
+    plane_model = None
+    plane_vis = None
+    if TABLE_PLANE_MODE != "off":
+        mode = TABLE_PLANE_MODE.lower().strip()
+        if mode == "fit":
+            plane_model = _fit_table_plane(
+                pcd_rgb,
+                distance_threshold=TABLE_PLANE_RANSAC_THRESH,
+                ransac_n=TABLE_PLANE_RANSAC_N,
+                num_iterations=TABLE_PLANE_RANSAC_ITERS,
+                downsample=TABLE_PLANE_DOWNSAMPLE,
+                up_axis=TABLE_PLANE_UP_AXIS,
+                max_tilt_deg=TABLE_PLANE_MAX_TILT_DEG
+            )
+            _save_plane(TABLE_PLANE_FILE, plane_model)
+            print(f"Saved table plane: {TABLE_PLANE_FILE}")
+        elif mode == "load":
+            if not TABLE_PLANE_FILE.exists():
+                raise FileNotFoundError(f"Table plane file not found: {TABLE_PLANE_FILE}")
+            plane_model = _load_plane(TABLE_PLANE_FILE)
+            print(f"Loaded table plane: {TABLE_PLANE_FILE}")
+        else:
+            raise ValueError(f"Unknown TABLE_PLANE_MODE: {TABLE_PLANE_MODE}")
+
+        if TABLE_PLANE_VIS_ENABLE:
+            plane_vis = _make_plane_line_set(
+                plane_model,
+                pcd_rgb,
+                color=TABLE_PLANE_VIS_COLOR,
+                scale=TABLE_PLANE_VIS_SCALE,
+                normal_color=TABLE_PLANE_NORMAL_COLOR,
+                normal_scale=TABLE_PLANE_NORMAL_SCALE,
+                normal_radius=TABLE_PLANE_NORMAL_RADIUS,
+                grid_lines=TABLE_PLANE_VIS_GRID
+            )
+
+        if TABLE_SLICE_ENABLE:
+            pcd_rgb, conf = _slice_pcd_by_plane(
+                pcd_rgb, conf, plane_model,
+                keep_side=TABLE_SLICE_KEEP_SIDE,
+                margin=TABLE_SLICE_MARGIN
+            )
+            print(f"After table slice ({TABLE_SLICE_KEEP_SIDE}): {len(pcd_rgb.points)} points")
+
+    auto_crop_min = None
+    auto_crop_max = None
+    if AUTO_OBJECT_CROP_ENABLE:
+        if plane_model is None:
+            raise ValueError("Adaptive object crop requires table-plane fitting.")
+        auto_crop_min, auto_crop_max = _auto_object_crop_bounds(
+            pcd_rgb,
+            plane_model,
+            min_height_m=AUTO_OBJECT_MIN_HEIGHT_M,
+            cluster_eps_m=AUTO_OBJECT_CLUSTER_EPS_M,
+            cluster_min_points=AUTO_OBJECT_CLUSTER_MIN_POINTS,
+            neighbor_max_gap_m=AUTO_OBJECT_NEIGHBOR_MAX_GAP_M,
+            xy_margin_m=AUTO_OBJECT_XY_MARGIN_M,
+            top_margin_m=AUTO_OBJECT_TOP_MARGIN_M,
+            table_below_margin_m=AUTO_OBJECT_TABLE_BELOW_MARGIN_M,
+        )
+        pcd_rgb, conf = tsdf_integration.crop_pcd_aabb_with_conf(
+            pcd_rgb, conf, auto_crop_min, auto_crop_max
+        )
+        print(f"After adaptive object crop: {len(pcd_rgb.points)} points")
+
+    pcd_rgb, conf = tsdf_integration.filter_outliers_with_conf(
+        pcd_rgb, conf,
+        method=OUTLIER_METHOD,
+        nb_neighbors=OUTLIER_NB_NEIGHBORS,
+        std_ratio=OUTLIER_STD_RATIO,
+        nb_points=OUTLIER_NB_POINTS,
+        radius=OUTLIER_RADIUS
+    )
+    print(f"After outlier filter ({OUTLIER_METHOD}): {len(pcd_rgb.points)} points")
+
+    pcd_conf = tsdf_integration.make_confidence_colored_pcd(
+        pcd_rgb, conf,
+        clip_percentile=CONF_CLIP_PERCENTILE,
+        cv_colormap=CONF_COLORMAP
+    )
+
+    if visualize:
+        axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+
+        def _draw_geoms(geoms):
+            if hasattr(o3d.visualization, "draw"):
+                o3d.visualization.draw(geoms)
+            else:
+                o3d.visualization.draw_geometries(geoms)
+
+        print("Visualizing RGB-colored TSDF surface point cloud")
+        geoms_rgb = [pcd_rgb, axes]
+        if plane_vis is not None:
+            geoms_rgb.extend(plane_vis)
+        _draw_geoms(geoms_rgb)
+
+        print("Visualizing CONFIDENCE gradient (TURBO) for TSDF surface point cloud")
+        geoms_conf = [pcd_conf, axes]
+        if plane_vis is not None:
+            geoms_conf.extend(plane_vis)
+        _draw_geoms(geoms_conf)
+
+    out_mesh = output_folder / "tsdf_surface_mesh.stl"
+    mesh_out = mesh
+    if auto_crop_min is not None and auto_crop_max is not None:
+        aabb = o3d.geometry.AxisAlignedBoundingBox(auto_crop_min, auto_crop_max)
+        mesh_out = mesh.crop(aabb)
+    elif CROP_ENABLE:
+        aabb = o3d.geometry.AxisAlignedBoundingBox(CROP_MIN, CROP_MAX)
+        mesh_out = mesh.crop(aabb)
+    mesh_out = _clean_mesh_for_export(mesh_out, mesh_min_component_triangles)
+    if len(mesh_out.triangles) == 0:
+        raise ValueError("Mesh cleanup/cropping removed every triangle; relax the crop or component limit.")
+    if not o3d.io.write_triangle_mesh(str(out_mesh), mesh_out):
+        raise IOError(f"Failed to write mesh: {out_mesh}")
+    print("Saved:", out_mesh)
+
+    # Keep an indexed mesh alongside STL. STL duplicates vertices by design;
+    # PLY also retains measured vertex colors for RViz and downstream processing.
+    # Publish this service output atomically so readers never see a partial PLY.
+    out_mesh_ply = output_folder / "tsdf_surface_mesh.ply"
+    temp_mesh_ply = output_folder / ".tsdf_surface_mesh.tmp.ply"
+    if not o3d.io.write_triangle_mesh(str(temp_mesh_ply), mesh_out):
+        raise IOError(f"Failed to write colored mesh: {temp_mesh_ply}")
+    temp_mesh_ply.replace(out_mesh_ply)
+    print("Saved:", out_mesh_ply)
+
+    out_rgb = output_folder / "tsdf_surface_rgb_colored.ply"
+    out_conf = output_folder / "tsdf_surface_confidence_colored.ply"
+    for path, cloud in ((out_rgb, pcd_rgb), (out_conf, pcd_conf)):
+        if len(cloud.points) == 0:
+            raise ValueError("No colored points survived. Check color_min_observations, depth tolerance and crops.")
+        if not o3d.io.write_point_cloud(str(path), cloud):
+            raise IOError(f"Failed to write point cloud: {path}")
+        print("Saved:", path)
+    return out_rgb

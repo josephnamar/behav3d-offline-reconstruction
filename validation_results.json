@@ -1,0 +1,107 @@
+{
+  "reference": "Previously validated corrected/cleaned reconstruction",
+  "scans": [
+    {
+      "session": "261113_145255",
+      "frames": 20,
+      "vertices": 251081,
+      "triangles": 490617,
+      "max_vertex_distance_mm": 0.0,
+      "same_faces": true,
+      "reference_color_max_difference": null,
+      "source_files_unchanged": true,
+      "elapsed_seconds": 4.344
+    },
+    {
+      "session": "261113_150006",
+      "frames": 20,
+      "vertices": 230790,
+      "triangles": 457519,
+      "max_vertex_distance_mm": 0.0,
+      "same_faces": true,
+      "reference_color_max_difference": 0.0,
+      "source_files_unchanged": true,
+      "elapsed_seconds": 3.981
+    },
+    {
+      "session": "261113_150432",
+      "frames": 16,
+      "vertices": 265627,
+      "triangles": 524590,
+      "max_vertex_distance_mm": 0.0,
+      "same_faces": true,
+      "reference_color_max_difference": null,
+      "source_files_unchanged": true,
+      "elapsed_seconds": 3.749
+    },
+    {
+      "session": "261113_150709",
+      "frames": 20,
+      "vertices": 249413,
+      "triangles": 486885,
+      "max_vertex_distance_mm": 0.0,
+      "same_faces": true,
+      "reference_color_max_difference": null,
+      "source_files_unchanged": true,
+      "elapsed_seconds": 4.268
+    },
+    {
+      "session": "261113_151101",
+      "frames": 20,
+      "vertices": 228099,
+      "triangles": 452239,
+      "max_vertex_distance_mm": 0.0,
+      "same_faces": true,
+      "reference_color_max_difference": null,
+      "source_files_unchanged": true,
+      "elapsed_seconds": 3.867
+    },
+    {
+      "session": "261113_151435",
+      "frames": 16,
+      "vertices": 263754,
+      "triangles": 520859,
+      "max_vertex_distance_mm": 0.0,
+      "same_faces": true,
+      "reference_color_max_difference": null,
+      "source_files_unchanged": true,
+      "elapsed_seconds": 3.696
+    },
+    {
+      "session": "261113_151637",
+      "frames": 20,
+      "vertices": 252086,
+      "triangles": 492468,
+      "max_vertex_distance_mm": 0.0,
+      "same_faces": true,
+      "reference_color_max_difference": null,
+      "source_files_unchanged": true,
+      "elapsed_seconds": 4.122
+    },
+    {
+      "session": "261113_152024",
+      "frames": 20,
+      "vertices": 229550,
+      "triangles": 455101,
+      "max_vertex_distance_mm": 0.0,
+      "same_faces": true,
+      "reference_color_max_difference": null,
+      "source_files_unchanged": true,
+      "elapsed_seconds": 3.929
+    },
+    {
+      "session": "261113_152345",
+      "frames": 16,
+      "vertices": 264905,
+      "triangles": 523190,
+      "max_vertex_distance_mm": 0.0,
+      "same_faces": true,
+      "reference_color_max_difference": null,
+      "source_files_unchanged": true,
+      "elapsed_seconds": 3.751
+    }
+  ],
+  "scan_count": 9,
+  "capture_count": 168,
+  "all_geometry_identical": true
+}

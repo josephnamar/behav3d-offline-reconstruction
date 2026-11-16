@@ -1,0 +1,14 @@
+The reconstruction implementation and numerical tests originate from the
+behav3d_sense package of SDU-CREATE-BEHAV3D/behav3d_ws, commit
+40d99a046e584f4705a49c1044d4fc47bf7f079c. That package declares the MIT license
+in src/behav3d_sense/package.xml.
+
+Original module mapping:
+  reconstruct/TSDF_cpu_cropped.py -> offline_reconstruction/fusion.py
+  reconstruct/color_to_depth.py -> offline_reconstruction/color_to_depth.py
+  reconstruct/utils/* -> offline_reconstruction/utils/*
+
+Adaptations: explicit output paths, configurable fusion/color parameters,
+offline input discovery and validation, batch execution, confidence PLY
+export, CPU previews, and standalone tests/documentation. Robot capture,
+motion planning, ROS services and RViz publication are not included.
